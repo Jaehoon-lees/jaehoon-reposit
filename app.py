@@ -1,13 +1,16 @@
 import streamlit as st
 import requests
-import json
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from typing import Optional
 
-ZOOMINFO_BASE_URL = "https://api.zoominfo.com"
+# ── Constants ─────────────────────────────────────────────────────────────────
 
-STAFFBASE_ICP_TITLES = [
+ZOOMINFO_BASE_URL = "https://api.zoominfo.com"
+SERPER_URL = "https://google.serper.dev/search"
+
+STAFFBASE_ICP_TITLES_EN = [
     "Internal Communications",
     "Employee Communications",
     "Employee Experience",
@@ -15,29 +18,51 @@ STAFFBASE_ICP_TITLES = [
     "People & Culture",
     "HR Communications",
     "Workplace Experience",
-    "Internal Comms",
-    "People Communications",
     "Change Communications",
 ]
 
-STAFFBASE_ICP_LEVELS = [
-    "C-Level",
-    "VP",
-    "Director",
-    "Manager",
+STAFFBASE_ICP_TITLES_JP = [
+    "社内広報",
+    "インターナルコミュニケーション",
+    "従業員エクスペリエンス",
+    "広報部長",
+    "人事部長",
+    "コーポレートコミュニケーション",
+    "社員コミュニケーション",
 ]
 
+ICP_LEVELS = ["C-Level", "VP", "Director", "Manager", "部長", "執行役員", "取締役"]
+
+
+# ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
+class Contact:
+    name: str
+    title: str
+    company: str
+    email: str = ""
+    phone: str = ""
+    linkedin: str = ""
+    source: str = ""
+    source_url: str = ""
+    snippet: str = ""
+    score: int = 0
+
+
+# ── ZoomInfo ──────────────────────────────────────────────────────────────────
+
 class ZoomInfoClient:
-    username: str
-    password: str
-    _token: Optional[str] = None
+    def __init__(self, username: str, password: str):
+        self.username = username
+        self.password = password
+        self._token: Optional[str] = None
 
     def authenticate(self) -> bool:
         resp = requests.post(
             f"{ZOOMINFO_BASE_URL}/authenticate",
             json={"username": self.username, "password": self.password},
+            timeout=10,
         )
         if resp.status_code == 200:
             self._token = resp.json().get("jwt")
@@ -50,203 +75,293 @@ class ZoomInfoClient:
 
     def search_company(self, company_name: str) -> dict:
         payload = {
-            "outputFields": ["id", "name", "website", "revenue", "employeeCount", "industry"],
+            "outputFields": ["id", "name", "website", "employeeCount", "industry"],
             "matchCompanyInput": [{"name": company_name}],
         }
-        resp = requests.post(
-            f"{ZOOMINFO_BASE_URL}/enrich/company",
-            headers=self.headers,
-            json=payload,
-        )
-        return resp.json() if resp.status_code == 200 else {}
+        try:
+            resp = requests.post(f"{ZOOMINFO_BASE_URL}/enrich/company", headers=self.headers, json=payload, timeout=10)
+            return resp.json() if resp.status_code == 200 else {}
+        except Exception:
+            return {}
 
-    def search_icp_contacts(self, company_name: str, company_id: Optional[int] = None) -> list:
+    def search_icp_contacts(self, company_name: str, company_id: Optional[int] = None) -> list[Contact]:
         match_company = {"companyId": company_id} if company_id else {"name": company_name}
-
         payload = {
-            "outputFields": [
-                "id", "firstName", "lastName", "jobTitle",
-                "managementLevel", "email", "phone",
-                "companyName", "linkedInUrl",
-            ],
-            "personCriteria": {
-                "jobTitle": STAFFBASE_ICP_TITLES,
-            },
+            "outputFields": ["id", "firstName", "lastName", "jobTitle", "managementLevel", "email", "phone", "companyName", "linkedInUrl"],
+            "personCriteria": {"jobTitle": STAFFBASE_ICP_TITLES_EN},
             "companyList": [match_company],
         }
-        resp = requests.post(
-            f"{ZOOMINFO_BASE_URL}/search/contact",
-            headers=self.headers,
-            json=payload,
-        )
-        if resp.status_code != 200:
+        try:
+            resp = requests.post(f"{ZOOMINFO_BASE_URL}/search/contact", headers=self.headers, json=payload, timeout=10)
+            if resp.status_code != 200:
+                return []
+            raw = resp.json().get("data", {}).get("outputFields", [])
+            contacts = []
+            for c in raw:
+                contacts.append(Contact(
+                    name=f"{c.get('firstName', '')} {c.get('lastName', '')}".strip(),
+                    title=c.get("jobTitle", ""),
+                    company=c.get("companyName", company_name),
+                    email=c.get("email", ""),
+                    phone=c.get("phone", ""),
+                    linkedin=c.get("linkedInUrl", ""),
+                    source="ZoomInfo",
+                ))
+            return contacts
+        except Exception:
             return []
-        data = resp.json()
-        contacts = data.get("data", {}).get("outputFields", [])
-        return _filter_by_level(contacts)
 
 
-def _filter_by_level(contacts: list) -> list:
-    filtered = []
-    for c in contacts:
-        level = c.get("managementLevel", "")
-        if any(lvl.lower() in level.lower() for lvl in STAFFBASE_ICP_LEVELS):
-            filtered.append(c)
-    return filtered if filtered else contacts
+# ── Google / Nikkei via Serper ─────────────────────────────────────────────────
+
+class SerperClient:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def _search(self, query: str, num: int = 10) -> list[dict]:
+        try:
+            resp = requests.post(
+                SERPER_URL,
+                headers={"X-API-KEY": self.api_key, "Content-Type": "application/json"},
+                json={"q": query, "num": num},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                return resp.json().get("organic", [])
+        except Exception:
+            pass
+        return []
+
+    def google_search(self, company_name: str) -> list[Contact]:
+        titles_query = " OR ".join(f'"{t}"' for t in STAFFBASE_ICP_TITLES_EN[:5])
+        query = f'"{company_name}" ({titles_query}) Director OR VP OR Manager'
+        results = self._search(query)
+        return self._parse_results(results, company_name, source="Google")
+
+    def nikkei_search(self, company_name: str) -> list[Contact]:
+        jp_query = " OR ".join(STAFFBASE_ICP_TITLES_JP[:4])
+        query = f'site:nikkei.com "{company_name}" ({jp_query} OR 広報 OR 人事)'
+        results = self._search(query)
+        return self._parse_results(results, company_name, source="日経新聞")
+
+    def news_search(self, company_name: str) -> list[Contact]:
+        query = f'"{company_name}" "internal communications" OR "employee experience" OR "corporate communications" -site:linkedin.com'
+        results = self._search(query)
+        return self._parse_results(results, company_name, source="ニュース")
+
+    def _parse_results(self, results: list[dict], company_name: str, source: str) -> list[Contact]:
+        contacts = []
+        name_patterns = [
+            r'\b([A-Z][a-z]+ [A-Z][a-z]+)\b',
+            r'([一-龯々ぁ-ん]{2,4})\s*(?:部長|執行役員|取締役|マネージャー|ディレクター)',
+        ]
+        title_keywords = STAFFBASE_ICP_TITLES_EN + STAFFBASE_ICP_TITLES_JP + ["広報", "人事", "コミュニケーション"]
+
+        for r in results:
+            snippet = r.get("snippet", "")
+            title_text = r.get("title", "")
+            url = r.get("link", "")
+            combined = f"{title_text} {snippet}"
+
+            matched_title = next((kw for kw in title_keywords if kw.lower() in combined.lower()), "")
+            if not matched_title:
+                continue
+
+            for pattern in name_patterns:
+                for match in re.findall(pattern, combined):
+                    name = match if isinstance(match, str) else match[0]
+                    if name and name not in [c.name for c in contacts]:
+                        contacts.append(Contact(
+                            name=name,
+                            title=matched_title,
+                            company=company_name,
+                            source=source,
+                            source_url=url,
+                            snippet=snippet[:200],
+                        ))
+        return contacts
 
 
-def _score_contact(contact: dict) -> int:
-    """Score contact relevance to Staffbase ICP (higher = better fit)."""
+# ── Scoring ───────────────────────────────────────────────────────────────────
+
+def score_contact(contact: Contact) -> int:
     score = 0
-    title = (contact.get("jobTitle") or "").lower()
-    level = (contact.get("managementLevel") or "").lower()
+    title = (contact.title or "").lower()
 
-    priority_keywords = ["internal communications", "employee communications", "employee experience"]
-    secondary_keywords = ["corporate communications", "people & culture", "hr communications"]
+    priority = ["internal communications", "employee communications", "employee experience", "社内広報"]
+    secondary = ["corporate communications", "people & culture", "hr communications", "広報"]
 
-    if any(kw in title for kw in priority_keywords):
+    if any(kw in title for kw in priority):
         score += 3
-    elif any(kw in title for kw in secondary_keywords):
+    elif any(kw in title for kw in secondary):
         score += 2
 
-    if "c-level" in level or "vp" in level:
+    if contact.email:
         score += 2
-    elif "director" in level:
+    if contact.linkedin:
         score += 1
-
-    if contact.get("email"):
+    if contact.source == "ZoomInfo":
+        score += 2
+    if contact.source == "日経新聞":
         score += 1
 
     return score
 
 
+def deduplicate(contacts: list[Contact]) -> list[Contact]:
+    seen = set()
+    result = []
+    for c in contacts:
+        key = c.name.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            result.append(c)
+    return result
+
+
 # ── Streamlit UI ──────────────────────────────────────────────────────────────
 
-st.set_page_config(
-    page_title="Staffbase ICP Finder",
-    page_icon="🎯",
-    layout="wide",
-)
+st.set_page_config(page_title="Staffbase ICP Finder", page_icon="🎯", layout="wide")
 
 st.title("🎯 Staffbase ICP Finder")
-st.caption("기업명을 입력하면 Staffbase와 연관된 핵심 의사결정자(ICP)를 찾아드립니다.")
+st.caption("기업명을 입력하면 Google, 닛케이, ZoomInfo 등 여러 소스에서 Staffbase ICP 의사결정자를 찾아드립니다.")
 
 with st.sidebar:
-    st.header("🔑 ZoomInfo 인증")
-    st.caption("ZoomInfo 계정 정보를 입력하세요.")
-    username = st.text_input("이메일", value=os.getenv("ZOOMINFO_USERNAME", ""))
-    password = st.text_input("비밀번호", type="password", value=os.getenv("ZOOMINFO_PASSWORD", ""))
+    st.header("🔑 API 키 설정")
+
+    st.subheader("Serper.dev (Google 검색)")
+    st.caption("무료 가입 → serper.dev 에서 API 키 발급")
+    serper_key = st.text_input("Serper API Key", type="password", value=os.getenv("SERPER_API_KEY", ""))
 
     st.divider()
-    st.header("🎯 ICP 필터 설정")
-    st.caption("검색할 직책 키워드")
-    selected_titles = st.multiselect(
-        "직책 키워드",
-        options=STAFFBASE_ICP_TITLES,
-        default=STAFFBASE_ICP_TITLES,
-    )
-    st.caption("검색할 직급")
-    selected_levels = st.multiselect(
-        "직급",
-        options=STAFFBASE_ICP_LEVELS,
-        default=STAFFBASE_ICP_LEVELS,
-    )
+    st.subheader("ZoomInfo (선택)")
+    st.caption("ZoomInfo 계정이 있을 때만 입력하세요")
+    zi_username = st.text_input("이메일", value=os.getenv("ZOOMINFO_USERNAME", ""))
+    zi_password = st.text_input("비밀번호", type="password", value=os.getenv("ZOOMINFO_PASSWORD", ""))
 
     st.divider()
-    st.markdown(
-        """
-        **Staffbase ICP란?**
+    st.subheader("검색 소스 선택")
+    use_google = st.checkbox("Google 일반 검색", value=True)
+    use_nikkei = st.checkbox("닛케이 신문 (nikkei.com)", value=True)
+    use_news = st.checkbox("뉴스 기사 전체", value=True)
+    use_zoominfo = st.checkbox("ZoomInfo DB", value=bool(zi_username))
 
-        Staffbase는 직원 커뮤니케이션 플랫폼으로,
-        주요 구매 의사결정자는 다음과 같습니다:
-        - 내부 커뮤니케이션 담당자
-        - Employee Experience 담당자
-        - Corporate Communications 담당자
-        - HR 리더십
-        """
-    )
+    st.divider()
+    st.markdown("""
+    **API 키 발급 방법**
+    - **Serper.dev**: [serper.dev](https://serper.dev) 가입 → Dashboard → API Key 복사 (월 2,500건 무료)
+    - **ZoomInfo**: 기존 계정 그대로 사용
+    """)
 
 col1, col2 = st.columns([3, 1])
 with col1:
-    company_input = st.text_input(
-        "기업명 검색",
-        placeholder="예: Deutsche Telekom, Siemens, Bosch...",
-        label_visibility="collapsed",
-    )
+    company_input = st.text_input("기업명", placeholder="예: Siemens, Toyota, Bosch, NTT...", label_visibility="collapsed")
 with col2:
     search_btn = st.button("검색", type="primary", use_container_width=True)
 
 if search_btn and company_input:
-    if not username or not password:
-        st.error("사이드바에서 ZoomInfo 계정 정보를 입력해주세요.")
+    if not serper_key and not (zi_username and zi_password):
+        st.error("최소 하나의 API 키(Serper 또는 ZoomInfo)가 필요합니다.")
         st.stop()
 
-    client = ZoomInfoClient(username=username, password=password)
+    all_contacts: list[Contact] = []
+    source_status = {}
 
-    with st.spinner("ZoomInfo 인증 중..."):
-        auth_ok = client.authenticate()
+    if serper_key:
+        serper = SerperClient(serper_key)
 
-    if not auth_ok:
-        st.error("ZoomInfo 인증에 실패했습니다. 계정 정보를 확인해주세요.")
-        st.stop()
+        if use_google:
+            with st.spinner("Google 검색 중..."):
+                results = serper.google_search(company_input)
+                all_contacts.extend(results)
+                source_status["Google"] = len(results)
 
-    company_id = None
-    company_info = {}
+        if use_nikkei:
+            with st.spinner("닛케이 신문 검색 중..."):
+                results = serper.nikkei_search(company_input)
+                all_contacts.extend(results)
+                source_status["日経新聞"] = len(results)
 
-    with st.spinner(f"'{company_input}' 기업 정보 조회 중..."):
-        company_data = client.search_company(company_input)
-        results = company_data.get("data", [])
-        if results:
-            company_info = results[0] if isinstance(results, list) else results
-            company_id = company_info.get("id")
+        if use_news:
+            with st.spinner("뉴스 기사 검색 중..."):
+                results = serper.news_search(company_input)
+                all_contacts.extend(results)
+                source_status["ニュース"] = len(results)
 
-    if company_info:
-        st.subheader(f"🏢 {company_info.get('name', company_input)}")
-        meta_cols = st.columns(3)
-        with meta_cols[0]:
-            st.metric("직원 수", f"{company_info.get('employeeCount', 'N/A'):,}" if isinstance(company_info.get('employeeCount'), int) else "N/A")
-        with meta_cols[1]:
-            st.metric("업종", company_info.get("industry", "N/A"))
-        with meta_cols[2]:
-            website = company_info.get("website", "")
-            st.metric("웹사이트", website or "N/A")
+    if use_zoominfo and zi_username and zi_password:
+        with st.spinner("ZoomInfo 인증 및 검색 중..."):
+            zi = ZoomInfoClient(zi_username, zi_password)
+            if zi.authenticate():
+                company_data = zi.search_company(company_input)
+                company_results = company_data.get("data", [])
+                company_id = None
+                if company_results:
+                    info = company_results[0] if isinstance(company_results, list) else company_results
+                    company_id = info.get("id")
+                    st.subheader(f"🏢 {info.get('name', company_input)}")
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        emp = info.get("employeeCount")
+                        st.metric("직원 수", f"{emp:,}" if isinstance(emp, int) else "N/A")
+                    with c2:
+                        st.metric("업종", info.get("industry", "N/A"))
+                    with c3:
+                        st.metric("웹사이트", info.get("website", "N/A"))
+
+                zi_contacts = zi.search_icp_contacts(company_input, company_id)
+                all_contacts.extend(zi_contacts)
+                source_status["ZoomInfo"] = len(zi_contacts)
+            else:
+                st.warning("ZoomInfo 인증 실패. 다른 소스 결과만 표시합니다.")
+
+    # 소스별 요약
+    if source_status:
+        st.markdown("**검색 결과 요약**")
+        cols = st.columns(len(source_status))
+        for i, (src, cnt) in enumerate(source_status.items()):
+            with cols[i]:
+                st.metric(src, f"{cnt}명 발견")
+
+    # 중복 제거 + 스코어링
+    unique_contacts = deduplicate(all_contacts)
+    scored = sorted(unique_contacts, key=score_contact, reverse=True)
+
+    if not scored:
+        st.warning(f"'{company_input}'에서 Staffbase ICP 조건에 맞는 담당자를 찾지 못했습니다.")
+        st.info("검색 팁: 회사 영문명 또는 일본어 정식 명칭으로 다시 시도해보세요.")
     else:
-        st.info(f"'{company_input}'의 기업 정보를 찾지 못했습니다. 연락처 검색을 계속합니다.")
-
-    with st.spinner("ICP 의사결정자 검색 중..."):
-        contacts = client.search_icp_contacts(company_input, company_id)
-
-    if not contacts:
-        st.warning("해당 기업에서 Staffbase ICP 조건에 맞는 담당자를 찾지 못했습니다.")
-    else:
-        scored = sorted(contacts, key=_score_contact, reverse=True)
-
         st.subheader(f"👥 ICP 의사결정자 {len(scored)}명 발견")
 
         for i, contact in enumerate(scored):
-            relevance = _score_contact(contact)
-            badge = "🔥 최우선" if relevance >= 5 else "✅ 적합" if relevance >= 3 else "📋 참고"
+            s = score_contact(contact)
+            badge = "🔥 최우선" if s >= 5 else "✅ 적합" if s >= 3 else "📋 참고"
+            source_tag = f"[{contact.source}]"
 
             with st.expander(
-                f"{badge} | {contact.get('firstName', '')} {contact.get('lastName', '')} — {contact.get('jobTitle', 'N/A')}",
+                f"{badge} {source_tag} | {contact.name} — {contact.title}",
                 expanded=(i < 3),
             ):
-                info_cols = st.columns(2)
-                with info_cols[0]:
-                    st.markdown(f"**직책:** {contact.get('jobTitle', 'N/A')}")
-                    st.markdown(f"**직급:** {contact.get('managementLevel', 'N/A')}")
-                    st.markdown(f"**회사:** {contact.get('companyName', 'N/A')}")
-                with info_cols[1]:
-                    email = contact.get("email", "")
-                    phone = contact.get("phone", "")
-                    linkedin = contact.get("linkedInUrl", "")
-                    st.markdown(f"**이메일:** {email if email else '비공개'}")
-                    st.markdown(f"**전화:** {phone if phone else '비공개'}")
-                    if linkedin:
-                        st.markdown(f"**LinkedIn:** [프로필 보기]({linkedin})")
+                left, right = st.columns(2)
+                with left:
+                    st.markdown(f"**이름:** {contact.name}")
+                    st.markdown(f"**직책:** {contact.title}")
+                    st.markdown(f"**회사:** {contact.company}")
+                    st.markdown(f"**출처:** {contact.source}")
+                with right:
+                    if contact.email:
+                        st.markdown(f"**이메일:** {contact.email}")
+                    if contact.phone:
+                        st.markdown(f"**전화:** {contact.phone}")
+                    if contact.linkedin:
+                        st.markdown(f"**LinkedIn:** [프로필 보기]({contact.linkedin})")
+                    if contact.source_url:
+                        st.markdown(f"**기사/링크:** [보기]({contact.source_url})")
+
+                if contact.snippet:
+                    st.caption(f"📄 {contact.snippet}")
 
         st.divider()
-        st.caption(f"총 {len(scored)}명 | 관련도 순으로 정렬됨")
+        st.caption(f"총 {len(scored)}명 | 관련도 순 정렬 | 중복 제거 완료")
 
 elif search_btn and not company_input:
     st.warning("기업명을 입력해주세요.")
