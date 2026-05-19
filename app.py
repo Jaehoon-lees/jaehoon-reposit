@@ -151,11 +151,17 @@ class SerperClient:
 
     def _parse_results(self, results: list[dict], company_name: str, source: str) -> list[Contact]:
         contacts = []
-        name_patterns = [
-            r'\b([A-Z][a-z]+ [A-Z][a-z]+)\b',
-            r'([一-龯々ぁ-ん]{2,4})\s*(?:部長|執行役員|取締役|マネージャー|ディレクター)',
-        ]
         title_keywords = STAFFBASE_ICP_TITLES_EN + STAFFBASE_ICP_TITLES_JP + ["広報", "人事", "コミュニケーション"]
+
+        # 이름으로 오인되기 쉬운 일반 단어 블랙리스트
+        non_names = {
+            kw.lower() for kw in title_keywords
+        } | {
+            "internal", "employee", "corporate", "communications", "experience",
+            "director", "manager", "joins", "panel", "summit", "report",
+            "siemens", "toyota", "bosch", "ntt", company_name.lower(),
+            "社内広報", "広報", "人事", "コミュニケーション",
+        }
 
         for r in results:
             snippet = r.get("snippet", "")
@@ -167,18 +173,37 @@ class SerperClient:
             if not matched_title:
                 continue
 
-            for pattern in name_patterns:
-                for match in re.findall(pattern, combined):
-                    name = match if isinstance(match, str) else match[0]
-                    if name and name not in [c.name for c in contacts]:
-                        contacts.append(Contact(
-                            name=name,
-                            title=matched_title,
-                            company=company_name,
-                            source=source,
-                            source_url=url,
-                            snippet=snippet[:200],
-                        ))
+            # 영문 이름: 직책 키워드 앞뒤에 붙은 "FirstName LastName" 패턴만 추출
+            # 예: "Sarah Johnson, Director of Internal Communications"
+            en_pattern = r'\b([A-Z][a-z]{2,}\s[A-Z][a-z]{2,})\b'
+            for match in re.findall(en_pattern, combined):
+                words = match.lower().split()
+                if any(w in non_names for w in words):
+                    continue
+                if match not in [c.name for c in contacts]:
+                    contacts.append(Contact(
+                        name=match,
+                        title=matched_title,
+                        company=company_name,
+                        source=source,
+                        source_url=url,
+                        snippet=snippet[:200],
+                    ))
+
+            # 일본어 이름: "氏名 + 직책" 패턴 (예: "田中 誠氏", "田中誠部長")
+            jp_pattern = r'([一-龯]{1,3}[\s　]?[一-龯]{1,3})(?:氏|さん|部長|執行役員|取締役|マネージャー|ディレクター)'
+            for match in re.findall(jp_pattern, combined):
+                name = match.strip()
+                if len(name) >= 2 and name not in [c.name for c in contacts]:
+                    contacts.append(Contact(
+                        name=name,
+                        title=matched_title,
+                        company=company_name,
+                        source=source,
+                        source_url=url,
+                        snippet=snippet[:200],
+                    ))
+
         return contacts
 
 
